@@ -73,6 +73,9 @@ You will then see the output plot showing the target star and any other detectio
 
 The matplotlib controls are active in this side by side plot, so you can click on the magnifying glass icon and `click-drag` over the color bar at the right of the image to bring any dim background stars into view.
 
+![CY Aqr](CY%20Aqr.png)
+
+
 
 
 
