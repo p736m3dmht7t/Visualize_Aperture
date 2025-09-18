@@ -96,7 +96,7 @@ if __name__ == '__main__':
             y_pixel_offset_raw = delta_dec_arcsec / image_scale
 
             closest_gaia_idx_candidate = np.argmin(separations)
-            if separations[closest_gaia_idx_candidate] < (image_scale * u.arcsec / 2.0):
+            if separations[closest_gaia_idx_candidate] < (image_scale * u.arcsec * 2.0):
                 target_gmag = gaia_stars['Gmag'][closest_gaia_idx_candidate]
                 target_is_in_gaia = True
                 closest_gaia_idx = closest_gaia_idx_candidate
