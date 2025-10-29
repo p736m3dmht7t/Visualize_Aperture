@@ -79,4 +79,7 @@ The matplotlib controls are active in this side by side plot, so you can click o
 
 The software is provided “AS IS”, without warranty of any kind under the MIT license.  See LICENSE.md for details.
 
+## TODO
+
+Include third light contamination in the sky annulus.
 
