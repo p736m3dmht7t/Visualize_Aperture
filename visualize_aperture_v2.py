@@ -24,6 +24,277 @@ from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photo
 from astropy.modeling.models import Gaussian2D
 from astropy.nddata import block_reduce
 import warnings
+from pathlib import Path
+from datetime import datetime, timedelta
+import urllib.request
+import urllib.error
+
+# Oversampling factor ensures each star's Gaussian PSF is rendered on a finer grid
+# before being rebinned to the working resolution, preserving profile fidelity.
+OVERSAMPLING_FACTOR = 5
+DEBUG_PRINT_GAIA_ROW = True
+MAMAJEK_TABLE_URL = "https://www.pas.rochester.edu/~emamajek/EEM_dwarf_UBVIJHK_colors_Teff.txt"
+MAMAJEK_CACHE_FILENAME = "EEM_dwarf_UBVIJHK_colors_Teff.txt"
+MAMAJEK_CACHE_DIR = ".cache"
+MAMAJEK_REFRESH_DAYS = 14
+_MAMAJEK_ROWS = None
+
+
+def _as_float(value):
+    """Return the given column value as a float, or None if invalid/masked."""
+    if value is None:
+        return None
+    if np.ma.is_masked(value):
+        return None
+    # Allow astropy Quantity values (e.g., distances) to be converted to plain floats
+    if hasattr(value, "to_value"):
+        try:
+            value = value.to_value()
+        except Exception:
+            try:
+                value = value.value
+            except Exception:
+                return None
+    elif hasattr(value, "value") and not isinstance(value, (float, int, np.floating, np.integer)):
+        try:
+            value = value.value
+        except Exception:
+            return None
+    try:
+        float_val = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(float_val):
+        return None
+    return float_val
+
+
+def _download_mamajek_table(target_path: Path):
+    try:
+        with urllib.request.urlopen(MAMAJEK_TABLE_URL, timeout=30) as response, open(target_path, "wb") as out_f:
+            out_f.write(response.read())
+    except Exception as e:
+        raise RuntimeError(f"Failed to download Mamajek dwarf table: {e}") from e
+
+
+def _load_mamajek_table(cache_dir=MAMAJEK_CACHE_DIR, refresh_days=MAMAJEK_REFRESH_DAYS) -> Path:
+    cache_dir_path = Path(cache_dir)
+    if not cache_dir_path.is_absolute():
+        cache_dir_path = Path(__file__).resolve().parent / cache_dir_path
+    cache_dir_path.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir_path / MAMAJEK_CACHE_FILENAME
+
+    needs_refresh = True
+    if cache_file.exists():
+        file_age = datetime.now() - datetime.fromtimestamp(cache_file.stat().st_mtime)
+        if file_age < timedelta(days=refresh_days):
+            needs_refresh = False
+    if needs_refresh:
+        try:
+            _download_mamajek_table(cache_file)
+        except Exception as ex:
+            if cache_file.exists():
+                print(f"Warning: Could not refresh Mamajek table ({ex}). Using cached copy.")
+            else:
+                raise
+    return cache_file
+
+
+def _parse_mamajek_table(table_path: Path):
+    header_map = {}
+    rows = []
+    try:
+        with open(table_path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    if line.startswith("#SpT"):
+                        header_tokens = line.lstrip("#").split()
+                        header_map = {token: idx for idx, token in enumerate(header_tokens)}
+                    continue
+                if not header_map:
+                    continue
+                parts = line.split()
+                sp_idx = header_map.get("SpT")
+                if sp_idx is None or sp_idx >= len(parts):
+                    continue
+                spectral_type = parts[sp_idx]
+                if "V" not in spectral_type:
+                    continue
+
+                def extract_float(column_name):
+                    idx = header_map.get(column_name)
+                    if idx is None or idx >= len(parts):
+                        return None
+                    value = parts[idx]
+                    if value in {"...", "....."}:
+                        return None
+                    try:
+                        return float(value)
+                    except ValueError:
+                        return None
+
+                bp_rp = extract_float("Bp-Rp")
+                m_g = extract_float("M_G")
+                teff = extract_float("Teff")
+                if bp_rp is None or m_g is None:
+                    continue
+                rows.append(
+                    {
+                        "spectral_type": spectral_type,
+                        "bp_rp": bp_rp,
+                        "M_G": m_g,
+                        "Teff": teff,
+                    }
+                )
+    except FileNotFoundError as e:
+        raise RuntimeError(f"Mamajek table not found at {table_path}") from e
+    rows.sort(key=lambda r: r["bp_rp"])
+    return rows
+
+
+def _get_mamajek_rows():
+    global _MAMAJEK_ROWS
+    if _MAMAJEK_ROWS is None:
+        try:
+            table_path = _load_mamajek_table()
+            _MAMAJEK_ROWS = _parse_mamajek_table(table_path)
+        except Exception as ex:
+            print(f"Warning: Unable to load Mamajek spectral table ({ex}).")
+            _MAMAJEK_ROWS = []
+    return _MAMAJEK_ROWS
+
+
+def _classify_star(abs_mag, adj_color):
+    if abs_mag is None or adj_color is None:
+        return None
+    rows = _get_mamajek_rows()
+    if not rows:
+        return None
+
+    color_sigma = 0.03
+    mag_sigma = 0.5
+    best_entry = None
+    best_score = None
+    best_color_diff = None
+    best_mag_diff = None
+
+    for row in rows:
+        color_diff = adj_color - row["bp_rp"]
+        mag_diff = abs_mag - row["M_G"]
+        score = (color_diff / color_sigma) ** 2 + (mag_diff / mag_sigma) ** 2
+        if best_score is None or score < best_score:
+            best_score = score
+            best_entry = row
+            best_color_diff = color_diff
+            best_mag_diff = mag_diff
+
+    if best_entry is None:
+        return None
+
+    return {
+        "label": best_entry["spectral_type"],
+        "bp_rp": best_entry["bp_rp"],
+        "M_G": best_entry["M_G"],
+        "Teff": best_entry["Teff"],
+        "color_diff": best_color_diff,
+        "mag_diff": best_mag_diff,
+        "score": best_score,
+    }
+
+
+def _column_value(row, *names):
+    """Return the first available column value for the provided names."""
+    for name in names:
+        if name in row.colnames:
+            return _as_float(row[name])
+    return None
+
+
+def _column_text(row, *names):
+    """Return the first available column value as text, or None."""
+    for name in names:
+        if name in row.colnames:
+            value = row[name]
+            if np.ma.is_masked(value):
+                continue
+            return str(value)
+    return None
+
+
+def _parse_ra_input(value: str) -> float:
+    """Parse RA input in decimal degrees or sexagesimal (hh:mm:ss.s) into degrees."""
+    stripped = value.strip()
+    try:
+        return float(stripped)
+    except ValueError:
+        pass
+
+    separators = [":", " "]
+    for sep in separators:
+        if sep in stripped:
+            parts = stripped.split(sep)
+            break
+    else:
+        raise ValueError(f"Invalid RA input: '{value}'")
+
+    if len(parts) != 3:
+        raise ValueError(f"Invalid RA sexagesimal format: '{value}'")
+
+    try:
+        hours = float(parts[0])
+        minutes = float(parts[1])
+        seconds = float(parts[2])
+    except ValueError as exc:
+        raise ValueError(f"Invalid RA sexagesimal components: '{value}'") from exc
+
+    if not (0 <= minutes < 60) or not (0 <= seconds < 60):
+        raise ValueError(f"Invalid RA sexagesimal range: '{value}'")
+
+    total_hours = hours + minutes / 60.0 + seconds / 3600.0
+    return total_hours * 15.0
+
+
+def _parse_dec_input(value: str) -> float:
+    """Parse Dec input in decimal degrees or sexagesimal (±dd:mm:ss.s) into degrees."""
+    stripped = value.strip()
+    try:
+        return float(stripped)
+    except ValueError:
+        pass
+
+    sign = 1.0
+    if stripped.startswith("+"):
+        stripped = stripped[1:]
+    elif stripped.startswith("-"):
+        stripped = stripped[1:]
+        sign = -1.0
+
+    separators = [":", " "]
+    for sep in separators:
+        if sep in stripped:
+            parts = stripped.split(sep)
+            break
+    else:
+        raise ValueError(f"Invalid Dec input: '{value}'")
+
+    if len(parts) != 3:
+        raise ValueError(f"Invalid Dec sexagesimal format: '{value}'")
+
+    try:
+        degrees = float(parts[0])
+        minutes = float(parts[1])
+        seconds = float(parts[2])
+    except ValueError as exc:
+        raise ValueError(f"Invalid Dec sexagesimal components: '{value}'") from exc
+
+    if not (0 <= minutes < 60) or not (0 <= seconds < 60):
+        raise ValueError(f"Invalid Dec sexagesimal range: '{value}'")
+
+    total_degrees = degrees + minutes / 60.0 + seconds / 3600.0
+    return sign * total_degrees
 
 if __name__ == '__main__':
     print("--- GAIA Third Light PSF Visualizer ---")
@@ -31,8 +302,10 @@ if __name__ == '__main__':
 
     try:
         # --- 1. Input Parameters from User ---
-        ra_deg = float(input("Target RA (degrees): "))
-        dec_deg = float(input("Target Dec (degrees): "))
+        ra_input = input("Target RA (degrees or hh:mm:ss): ")
+        dec_input = input("Target Dec (degrees or ±dd:mm:ss): ")
+        ra_deg = _parse_ra_input(ra_input)
+        dec_deg = _parse_dec_input(dec_input)
         image_scale = float(input("Image Scale (arcseconds/pixel): "))
         fwhm_arcsec = float(input("Seeing FWHM (arcseconds): "))
         aperture_radius_pixels = float(input("Aperture Radius (pixels): "))
@@ -42,10 +315,6 @@ if __name__ == '__main__':
         custom_fov_str = input("Enter custom Field of View (arcseconds) or press Enter for calculated default: ")
         field_of_view_arcsec = float(custom_fov_str) if custom_fov_str else None 
         
-        oversampling_factor = 5 
-        target_gmag = 12.0      
-
-
         # --- 2. Calculate default field_of_view_arcsec if not provided ---
         if field_of_view_arcsec is None:
             default_fov_pixels = 4 * (annulus_inner_radius_pixels + annulus_width_pixels)
@@ -62,7 +331,13 @@ if __name__ == '__main__':
         print(f"Querying GAIA DR3 around {target_coord.to_string('hmsdms')} "
               f"with a radius of {search_radius.to(u.arcmin):.2f}")
 
-        vizier_query = Vizier(columns=['RA_ICRS', 'DE_ICRS', 'Gmag', 'Source'], row_limit=-1)
+        vizier_query = Vizier(
+            columns=[
+                'RA_ICRS', 'DE_ICRS', 'Gmag', 'BPmag', 'RPmag', 'BP-RP',
+                'E(BP-RP)', 'Dist', 'Plx', 'Source'
+            ],
+            row_limit=-1
+        )
         gaia_catalog_id = 'I/355/gaiadr3'
 
         try:
@@ -74,52 +349,138 @@ if __name__ == '__main__':
             exit()
 
         if not result_tables:
-            print("No stars found in GAIA DR3 catalog for this region. Using only a synthetic target star.")
-            gaia_stars = None
+            print("No GAIA DR3 sources found for the provided coordinates. Cannot determine target magnitude.")
+            exit()
         else:
             gaia_stars = result_tables[0]
+            if len(gaia_stars) == 0:
+                print("GAIA DR3 query returned zero sources. Cannot determine target magnitude.")
+                exit()
             print(f"Found {len(gaia_stars)} GAIA DR3 sources.")
 
         # --- 4. Identify the target in the GAIA list, or add it if not present ---
-        target_is_in_gaia = False
         closest_gaia_idx = -1
         x_pixel_offset_raw = np.array([])
         y_pixel_offset_raw = np.array([])
 
-        if gaia_stars is not None:
-            gaia_coords = SkyCoord(ra=gaia_stars['RA_ICRS'], dec=gaia_stars['DE_ICRS'], unit='deg', frame='icrs')
-            separations = target_coord.separation(gaia_coords)
+        gaia_coords = SkyCoord(ra=gaia_stars['RA_ICRS'], dec=gaia_stars['DE_ICRS'], unit='deg', frame='icrs')
+        separations = target_coord.separation(gaia_coords)
 
-            delta_ra_arcsec = (gaia_coords.ra - target_coord.ra).to(u.arcsec).value
-            delta_dec_arcsec = (gaia_coords.dec - target_coord.dec).to(u.arcsec).value
-            x_pixel_offset_raw = (delta_ra_arcsec * np.cos(target_coord.dec.to(u.rad).value)) / image_scale
-            y_pixel_offset_raw = delta_dec_arcsec / image_scale
+        delta_ra_arcsec = (gaia_coords.ra - target_coord.ra).to(u.arcsec).value
+        delta_dec_arcsec = (gaia_coords.dec - target_coord.dec).to(u.arcsec).value
+        x_pixel_offset_raw = (delta_ra_arcsec * np.cos(target_coord.dec.to(u.rad).value)) / image_scale
+        y_pixel_offset_raw = delta_dec_arcsec / image_scale
 
-            closest_gaia_idx_candidate = np.argmin(separations)
-            if separations[closest_gaia_idx_candidate] < (image_scale * u.arcsec * 2.0):
-                target_gmag = gaia_stars['Gmag'][closest_gaia_idx_candidate]
-                target_is_in_gaia = True
-                closest_gaia_idx = closest_gaia_idx_candidate
-                # Change 2: Display Gmag with .3f format
-                print(f"Target found in GAIA DR3 (Gmag={target_gmag:.3f}).")
+        closest_gaia_idx_candidate = np.argmin(separations)
+        if separations[closest_gaia_idx_candidate] < (image_scale * u.arcsec * 2.0):
+            target_gmag = gaia_stars['Gmag'][closest_gaia_idx_candidate]
+            closest_gaia_idx = closest_gaia_idx_candidate
+            # Change 2: Display Gmag with .3f format
+            print(f"Target found in GAIA DR3 (Gmag={target_gmag:.3f}).")
+
+            target_row = gaia_stars[closest_gaia_idx]
+
+            if DEBUG_PRINT_GAIA_ROW:
+                print("\n=== DEBUG: GAIA target row (full contents) ===")
+                print(target_row)
+                print("=== DEBUG: End GAIA target row ===\n")
+
+            gaia_ra = _column_value(target_row, 'RA_ICRS')
+            gaia_dec = _column_value(target_row, 'DE_ICRS')
+            gaia_bp = _column_value(target_row, 'BPmag', 'phot_bp_mean_mag')
+            gaia_rp = _column_value(target_row, 'RPmag', 'phot_rp_mean_mag')
+            gaia_bp_rp = _column_value(target_row, 'BP-RP', 'BP_RP', 'bp_rp')
+            gaia_ebp_rp = _column_value(target_row, 'E(BP-RP)', 'E_BP-RP', 'ebpminusrp_gspphot')
+
+            dist_gspphot_pc = _column_value(target_row, 'Dist', 'distance_gspphot')
+            parallax_mas = _column_value(target_row, 'Plx', 'parallax')
+            parallax_distance_pc = None
+            if parallax_mas is not None and parallax_mas > 0:
+                parallax_distance_pc = 1000.0 / parallax_mas
+
+            gaia_dist_pc = None
+            distance_source = None
+            if dist_gspphot_pc is not None:
+                gaia_dist_pc = dist_gspphot_pc
+                distance_source = "distance_gspphot"
+            elif parallax_distance_pc is not None:
+                gaia_dist_pc = parallax_distance_pc
+                distance_source = "1/parallax"
+            gaia_source_id = _column_text(target_row, 'Source', 'source_id')
+
+            adjusted_bp_rp = None
+            if gaia_bp_rp is not None and gaia_ebp_rp is not None:
+                adjusted_bp_rp = gaia_bp_rp - gaia_ebp_rp
+
+            absolute_mag = None
+            if gaia_dist_pc is not None and gaia_dist_pc > 0:
+                absolute_mag = target_gmag - 5 * np.log10(gaia_dist_pc / 10.0)
+
+            classification = _classify_star(absolute_mag, adjusted_bp_rp)
+
+            print("\n--- Target Photometric Properties ---")
+            if gaia_source_id is not None:
+                print(f"GAIA Source ID: {gaia_source_id}")
             else:
-                print(f"Target not explicitly found in GAIA DR3 within 0.5 pixel. Using default target_gmag={target_gmag:.3f}.")
-        else:
-            print(f"Using default target_gmag={target_gmag:.3f}.")
+                print("GAIA Source ID: unavailable")
+            if gaia_ra is not None and gaia_dec is not None:
+                coord_icrs = SkyCoord(ra=gaia_ra * u.deg, dec=gaia_dec * u.deg, frame='icrs')
+                print(f"GAIA coordinate: RA={gaia_ra:.6f} deg, Dec={gaia_dec:.6f} deg ({coord_icrs.to_string('hmsdms')})")
+            else:
+                print("GAIA coordinate: unavailable")
 
-        if not target_is_in_gaia:
-            x_pixel_offset = np.insert(x_pixel_offset_raw, 0, 0.0)
-            y_pixel_offset = np.insert(y_pixel_offset_raw, 0, 0.0)
-            gaia_mags = np.array(gaia_stars['Gmag']) if gaia_stars is not None else np.array([])
-            gaia_ids = np.array(gaia_stars['Source']) if gaia_stars is not None else np.array([])
-            star_magnitudes = np.insert(gaia_mags, 0, target_gmag)
-            star_ids = np.insert(gaia_ids, 0, -1)
-            closest_gaia_idx = 0 
+            print("Magnitudes:")
+            print(f"  Gmag = {target_gmag:.3f}")
+            print(f"  BPmag = {gaia_bp:.3f}" if gaia_bp is not None else "  BPmag = unavailable")
+            print(f"  RPmag = {gaia_rp:.3f}" if gaia_rp is not None else "  RPmag = unavailable")
+            print(f"  BP-RP colour = {gaia_bp_rp:.3f}" if gaia_bp_rp is not None else "  BP-RP colour = unavailable")
+
+            if gaia_ebp_rp is not None:
+                print(f"Colour excess E(BP-RP) = {gaia_ebp_rp:.3f}")
+            else:
+                print("Colour excess E(BP-RP) = unavailable")
+
+            if adjusted_bp_rp is not None:
+                print(f"Adjusted BP-RP colour = {adjusted_bp_rp:.3f}")
+            else:
+                print("Adjusted BP-RP colour = unavailable")
+
+            if gaia_dist_pc is not None:
+                if distance_source == "distance_gspphot":
+                    print(f"Photometric distance (distance_gspphot) = {gaia_dist_pc:.1f} pc ({gaia_dist_pc * 3.26156:.1f} ly)")
+                elif distance_source == "1/parallax":
+                    print(f"Distance (1/parallax) = {gaia_dist_pc:.1f} pc ({gaia_dist_pc * 3.26156:.1f} ly)")
+                else:
+                    print(f"Distance = {gaia_dist_pc:.1f} pc ({gaia_dist_pc * 3.26156:.1f} ly)")
+            else:
+                print("Photometric distance = unavailable")
+
+            if absolute_mag is not None:
+                print(f"Absolute magnitude (G) = {absolute_mag:.3f}")
+            else:
+                print("Absolute magnitude (G) = unavailable")
+
+            if classification is not None:
+                label = classification["label"]
+                bp_color = classification["bp_rp"]
+                m_g_value = classification["M_G"]
+                teff = classification["Teff"]
+                details = f"Stellar type estimate: {label} (Bp-Rp≈{bp_color:.3f}, M_G≈{m_g_value:.2f}"
+                if teff is not None:
+                    details += f", Teff≈{teff:.0f} K"
+                details += ")"
+                print(details)
+            else:
+                print("Stellar type estimate: unavailable (insufficient data)")
+            print("-------------------------------\n")
         else:
-            x_pixel_offset = x_pixel_offset_raw
-            y_pixel_offset = y_pixel_offset_raw
-            star_magnitudes = np.array(gaia_stars['Gmag'])
-            star_ids = np.array(gaia_stars['Source'])
+            print("Target not found in GAIA DR3 near the provided coordinates. Please verify the inputs and try again.")
+            exit()
+
+        x_pixel_offset = x_pixel_offset_raw
+        y_pixel_offset = y_pixel_offset_raw
+        star_magnitudes = np.array(gaia_stars['Gmag'])
+        star_ids = np.array(gaia_stars['Source'])
 
         # --- 5. Image Grid Setup for PSF Simulation ---
         half_fov_pixels = (field_of_view_arcsec / 2.0) / image_scale
@@ -129,7 +490,7 @@ if __name__ == '__main__':
         base_x = np.arange(image_width_pixels) - (image_width_pixels - 1) / 2.0
         base_y = np.arange(image_width_pixels) - (image_width_pixels - 1) / 2.0
 
-        oversampled_width = image_width_pixels * oversampling_factor
+        oversampled_width = image_width_pixels * OVERSAMPLING_FACTOR
         oversampled_x = np.linspace(base_x.min(), base_x.max(), oversampled_width)
         oversampled_y = np.linspace(base_y.min(), base_y.max(), oversampled_width)
         oversampled_X, oversampled_Y = np.meshgrid(oversampled_x, oversampled_y)
@@ -145,7 +506,7 @@ if __name__ == '__main__':
         def create_image_from_indices(indices):
             synthetic_image_oversampled = np.zeros((oversampled_width, oversampled_width), dtype=np.float32)
             if len(indices) == 0:
-                return block_reduce(synthetic_image_oversampled, oversampling_factor, func=np.sum)
+                return block_reduce(synthetic_image_oversampled, OVERSAMPLING_FACTOR, func=np.sum)
 
             for i in indices:
                 star_mag = star_magnitudes[i]
@@ -156,7 +517,7 @@ if __name__ == '__main__':
                 )
                 synthetic_image_oversampled += star_psf(oversampled_X, oversampled_Y)
                 
-            return block_reduce(synthetic_image_oversampled, oversampling_factor, func=np.sum)
+            return block_reduce(synthetic_image_oversampled, OVERSAMPLING_FACTOR, func=np.sum)
 
         all_indices = np.arange(len(star_magnitudes))
         third_light_indices = np.delete(all_indices, closest_gaia_idx)
