@@ -1,0 +1,21 @@
+# RA in decimal or sexagesimal HOURS
+# Dec in decimal or sexagesimal DEGREES
+# Ref Star=0,1,missing (0=target star, 1=ref star, missing->first ap=target, others=ref)
+# Centroid=0,1,missing (0=do not centroid, 1=centroid, missing=centroid)
+# Apparent Magnitude or missing (value = apparent magnitude, or value > 99 or missing = no mag info)
+# Add one comma separated line per aperture in the following format:
+# RA, Dec, Ref Star, Centroid, Magnitude
+#Johnson_V filter magnitudes from APASS catalog
+15:08:09.140, +39:58:12.90, 0, 1, 99.999
+15:07:57.063, +39:35:04.80, 1, 1, 10.910
+15:09:31.355, +39:35:35.90, 1, 1, 11.352
+15:08:33.876, +39:29:43.92, 1, 1, 11.397
+15:08:03.423, +39:37:05.76, 1, 1, 11.646
+15:07:15.828, +39:30:55.50, 1, 1, 12.335
+15:07:23.858, +39:35:26.96, 1, 1, 13.029
+15:06:58.520, +39:33:48.56, 1, 1, 13.060
+15:09:26.932, +39:34:34.19, 1, 1, 13.185
+15:08:36.766, +39:31:41.79, 1, 1, 13.249
+15:07:26.909, +39:33:34.69, 1, 1, 13.744
+15:08:28.022, +39:30:47.65, 1, 1, 14.109
+15:06:37.900, +39:34:41.27, 1, 1, 14.380
