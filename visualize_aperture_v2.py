@@ -32,7 +32,7 @@ import urllib.error
 # Oversampling factor ensures each star's Gaussian PSF is rendered on a finer grid
 # before being rebinned to the working resolution, preserving profile fidelity.
 OVERSAMPLING_FACTOR = 5
-DEBUG_PRINT_GAIA_ROW = True
+DEBUG_PRINT_GAIA_ROW = False
 MAMAJEK_TABLE_URL = "https://www.pas.rochester.edu/~emamajek/EEM_dwarf_UBVIJHK_colors_Teff.txt"
 MAMAJEK_CACHE_FILENAME = "EEM_dwarf_UBVIJHK_colors_Teff.txt"
 MAMAJEK_CACHE_DIR = ".cache"
@@ -296,6 +296,81 @@ def _parse_dec_input(value: str) -> float:
     total_degrees = degrees + minutes / 60.0 + seconds / 3600.0
     return sign * total_degrees
 
+
+def _fetch_gaiaxpy_photometry(source_id_value):
+    """Fetch GaiaXPy synthetic photometry (JKC) for a Gaia source_id."""
+    if source_id_value is None:
+        return None
+    try:
+        from gaiaxpy import generate  # type: ignore
+    except ImportError:
+        print("GaiaXPy package is not installed; skipping synthetic photometry.")
+        return None
+
+    try:
+        source_id_int = int(str(source_id_value).strip())
+    except Exception:
+        print(f"Invalid Gaia source ID '{source_id_value}' for GaiaXPy; skipping synthetic photometry.")
+        return None
+
+    try:
+        result = generate(
+            source_id=[source_id_int],
+            photometric_system="JKC_Std",
+            save_file=False,
+        )
+    except Exception as exc:
+        print(f"GaiaXPy photometry request failed: {exc}")
+        return None
+
+    if result is None or len(result) == 0:
+        print("GaiaXPy returned no photometry for this source.")
+        return None
+
+    try:
+        if hasattr(result, "iloc"):
+            row = result.iloc[0]
+        elif isinstance(result, (list, tuple)):
+            row = result[0]
+        else:
+            row = result
+    except Exception:
+        print("Unable to parse GaiaXPy photometry output.")
+        return None
+
+    bands = ['U', 'B', 'V', 'R', 'I']
+    photometry = {}
+    for band in bands:
+        mag_key = f"JkcStd_mag_{band}"
+        flux_key = f"JkcStd_flux_{band}"
+        flux_err_key = f"JkcStd_flux_error_{band}"
+
+        mag_value = row.get(mag_key) if hasattr(row, "get") else row[mag_key]
+        flux_value = row.get(flux_key) if hasattr(row, "get") else row[flux_key]
+        flux_err_value = row.get(flux_err_key) if hasattr(row, "get") else row[flux_err_key]
+
+        mag_float = _as_float(mag_value)
+        flux_float = _as_float(flux_value)
+        flux_err_float = _as_float(flux_err_value)
+
+        photometry[mag_key] = mag_float
+
+        if flux_float is not None and flux_err_float is not None and flux_err_float > 0:
+            snr = flux_float / flux_err_float
+            if snr > 0:
+                mag_err = 2.5 / np.log(10) / snr
+                photometry[f"{mag_key}_error"] = mag_err
+            else:
+                photometry[f"{mag_key}_error"] = None
+        else:
+            photometry[f"{mag_key}_error"] = None
+
+    if all(photometry[key] is None for key in photometry if key.startswith("JkcStd_mag_")):
+        print("GaiaXPy photometry columns were unavailable in the response.")
+        return None
+
+    return photometry
+
 if __name__ == '__main__':
     print("--- GAIA Third Light PSF Visualizer ---")
     print("Please enter the following parameters:")
@@ -331,11 +406,13 @@ if __name__ == '__main__':
         print(f"Querying GAIA DR3 around {target_coord.to_string('hmsdms')} "
               f"with a radius of {search_radius.to(u.arcmin):.2f}")
 
+        if DEBUG_PRINT_GAIA_ROW:
+            vizier_columns = ['**']
+        else:
+            vizier_columns = ['**']
+
         vizier_query = Vizier(
-            columns=[
-                'RA_ICRS', 'DE_ICRS', 'Gmag', 'BPmag', 'RPmag', 'BP-RP',
-                'E(BP-RP)', 'Dist', 'Plx', 'Source'
-            ],
+            columns=vizier_columns,
             row_limit=-1
         )
         gaia_catalog_id = 'I/355/gaiadr3'
@@ -357,6 +434,13 @@ if __name__ == '__main__':
                 print("GAIA DR3 query returned zero sources. Cannot determine target magnitude.")
                 exit()
             print(f"Found {len(gaia_stars)} GAIA DR3 sources.")
+            if DEBUG_PRINT_GAIA_ROW:
+                print("\n=== DEBUG: Raw VizieR result table ===")
+                try:
+                    gaia_stars.pprint(max_lines=-1, max_width=500)
+                except Exception:
+                    print(gaia_stars)
+                print("=== DEBUG: End VizieR result table ===\n")
 
         # --- 4. Identify the target in the GAIA list, or add it if not present ---
         closest_gaia_idx = -1
@@ -390,7 +474,7 @@ if __name__ == '__main__':
             gaia_bp = _column_value(target_row, 'BPmag', 'phot_bp_mean_mag')
             gaia_rp = _column_value(target_row, 'RPmag', 'phot_rp_mean_mag')
             gaia_bp_rp = _column_value(target_row, 'BP-RP', 'BP_RP', 'bp_rp')
-            gaia_ebp_rp = _column_value(target_row, 'E(BP-RP)', 'E_BP-RP', 'ebpminusrp_gspphot')
+            gaia_ebp_rp = _column_value(target_row, 'E(BP-RP)', 'E_BP-RP', 'ebpminrp_gspphot')
 
             dist_gspphot_pc = _column_value(target_row, 'Dist', 'distance_gspphot')
             parallax_mas = _column_value(target_row, 'Plx', 'parallax')
@@ -407,6 +491,7 @@ if __name__ == '__main__':
                 gaia_dist_pc = parallax_distance_pc
                 distance_source = "1/parallax"
             gaia_source_id = _column_text(target_row, 'Source', 'source_id')
+            gaia_teff = _column_value(target_row, 'Teff_gspphot', 'Teff')
 
             adjusted_bp_rp = None
             if gaia_bp_rp is not None and gaia_ebp_rp is not None:
@@ -417,6 +502,7 @@ if __name__ == '__main__':
                 absolute_mag = target_gmag - 5 * np.log10(gaia_dist_pc / 10.0)
 
             classification = _classify_star(absolute_mag, adjusted_bp_rp)
+            gaiaxpy_photometry = _fetch_gaiaxpy_photometry(gaia_source_id)
 
             print("\n--- Target Photometric Properties ---")
             if gaia_source_id is not None:
@@ -445,6 +531,9 @@ if __name__ == '__main__':
             else:
                 print("Adjusted BP-RP colour = unavailable")
 
+            if gaia_teff is not None:
+                print(f"Effective temperature (teff_gspphot) = {gaia_teff:.0f} K")
+
             if gaia_dist_pc is not None:
                 if distance_source == "distance_gspphot":
                     print(f"Photometric distance (distance_gspphot) = {gaia_dist_pc:.1f} pc ({gaia_dist_pc * 3.26156:.1f} ly)")
@@ -464,14 +553,35 @@ if __name__ == '__main__':
                 label = classification["label"]
                 bp_color = classification["bp_rp"]
                 m_g_value = classification["M_G"]
-                teff = classification["Teff"]
+                derived_teff = classification["Teff"]
+                display_teff = gaia_teff if gaia_teff is not None else derived_teff
                 details = f"Stellar type estimate: {label} (Bp-Rp≈{bp_color:.3f}, M_G≈{m_g_value:.2f}"
-                if teff is not None:
-                    details += f", Teff≈{teff:.0f} K"
+                if display_teff is not None:
+                    if gaia_teff is not None:
+                        details += f", Teff≈{display_teff:.0f} K (teff_gspphot)"
+                    else:
+                        details += f", Teff≈{display_teff:.0f} K (table)"
                 details += ")"
                 print(details)
             else:
                 print("Stellar type estimate: unavailable (insufficient data)")
+
+            if gaiaxpy_photometry:
+                print("\n--- GaiaXPy Synthetic Photometry (JKC) ---")
+                for band in ['U', 'B', 'V', 'R', 'I']:
+                    mag_key = f"JkcStd_mag_{band}"
+                    err_key = f"{mag_key}_error"
+                    mag_value = gaiaxpy_photometry.get(mag_key)
+                    err_value = gaiaxpy_photometry.get(err_key)
+                    if mag_value is not None:
+                        if err_value is not None:
+                            print(f"  {band}-band magnitude = {mag_value:.3f} ± {err_value:.3f}")
+                        else:
+                            print(f"  {band}-band magnitude = {mag_value:.3f}")
+                    else:
+                        print(f"  {band}-band magnitude = unavailable")
+            else:
+                print("\nNo GaiaXPy synthetic photometry available for this source (spectra unavailable or query failed).")
             print("-------------------------------\n")
         else:
             print("Target not found in GAIA DR3 near the provided coordinates. Please verify the inputs and try again.")
