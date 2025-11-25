@@ -290,51 +290,73 @@ def _parse_dec_input(value: str) -> float:
 
 
 def _fetch_gaiaxpy_photometry(source_id_value):
-    """Fetch GaiaXPy synthetic photometry (JKC) for a Gaia source_id."""
+    """Fetch GaiaXPy synthetic photometry (JKC) for a Gaia source_id.
+    
+    Returns Johnson B, V and Cousins R, I magnitudes if available.
+    Returns None if gaiaxpy is not installed, source_id is invalid, 
+    or no synthetic photometry is available for this source.
+    """
     if source_id_value is None:
         return None
+    
     try:
-        from gaiaxpy import generate  # type: ignore
+        from gaiaxpy import generate, PhotometricSystem  # type: ignore
     except ImportError:
+        # gaiaxpy not installed - this is optional functionality
+        return None
+    except Exception:
+        # Catch any other exception during import
         return None
 
     try:
         source_id_int = int(str(source_id_value).strip())
     except Exception:
+        # Invalid source_id format - skip synthetic photometry
         return None
 
     try:
+        # source_id must be passed as positional argument, not keyword argument
         result = generate(
-            source_id=[source_id_int],
-            photometric_system="JKC_Std",
+            [source_id_int],
+            photometric_system=PhotometricSystem.JKC_Std,
             save_file=False,
         )
     except Exception:
+        # API call failed - synthetic photometry not available for this source
+        # This is expected for many stars, so we silently return None
         return None
 
     if result is None or len(result) == 0:
+        # No results returned - synthetic photometry not available
         return None
 
     try:
+        # result is a pandas DataFrame, access first row as Series
         if hasattr(result, "iloc"):
             row = result.iloc[0]
-        elif isinstance(result, (list, tuple)):
-            row = result[0]
         else:
-            row = result
+            # Fallback for unexpected return type
+            return None
     except Exception:
+        # Data access failed
         return None
 
-    bands = ['U', 'B', 'V', 'R', 'I']
+    # Only extract Johnson B, V and Cousins R, I (not U)
+    bands = ['B', 'V', 'R', 'I']
     photometry = {}
     for band in bands:
         mag_key = f"JkcStd_mag_{band}"
         flux_key = f"JkcStd_flux_{band}"
         flux_err_key = f"JkcStd_flux_error_{band}"
 
-        mag_value = row.get(mag_key) if hasattr(row, "get") else row[mag_key]
-        flux_value = row.get(flux_key) if hasattr(row, "get") else row[flux_key]
-        flux_err_value = row.get(flux_err_key) if hasattr(row, "get") else row[flux_err_key]
+        # Access DataFrame columns using bracket notation
+        try:
+            mag_value = row[mag_key]
+            flux_value = row[flux_key]
+            flux_err_value = row[flux_err_key]
+        except (KeyError, IndexError):
+            # Column not found - skip this band
+            continue
 
         mag_float = _as_float(mag_value)
         flux_float = _as_float(flux_value)
@@ -352,6 +374,7 @@ def _fetch_gaiaxpy_photometry(source_id_value):
         else:
             photometry[f"{mag_key}_error"] = None
 
+    # Return None only if no magnitudes were successfully extracted
     if all(photometry[key] is None for key in photometry if key.startswith("JkcStd_mag_")):
         return None
 
@@ -782,6 +805,28 @@ def process_targets_to_pdf(targets, output_filename, params):
             print(row)
             table_rows.append(row)
             
+            # Display gaiaxpy synthetic photometry if available (as continuation line)
+            target_info = res.get('target_info', {})
+            gaiaxpy_photometry = target_info.get('gaiaxpy_photometry')
+            if gaiaxpy_photometry:
+                # Format as continuation line: " #  | JKC: B=mag±err V=mag±err R=mag±err I=mag±err"
+                jkc_parts = []
+                for band in ['B', 'V', 'R', 'I']:
+                    mag_key = f"JkcStd_mag_{band}"
+                    err_key = f"{mag_key}_error"
+                    mag_value = gaiaxpy_photometry.get(mag_key)
+                    err_value = gaiaxpy_photometry.get(err_key)
+                    if mag_value is not None:
+                        if err_value is not None:
+                            jkc_parts.append(f"{band}={mag_value:.3f}+/-{err_value:.3f}")
+                        else:
+                            jkc_parts.append(f"{band}={mag_value:.3f}")
+                
+                if jkc_parts:
+                    jkc_line = f"{target_num:3d} | JKC: {' '.join(jkc_parts)}"
+                    print(jkc_line)
+                    table_rows.append(jkc_line)
+            
             # Plotting logic
             metrics = res['metrics']
             image_all = res['image_all']
@@ -971,14 +1016,14 @@ def main():
             gaiaxpy_photometry = target_info.get('gaiaxpy_photometry')
             if gaiaxpy_photometry:
                 print("\n--- GaiaXPy Synthetic Photometry (JKC) ---")
-                for band in ['U', 'B', 'V', 'R', 'I']:
+                for band in ['B', 'V', 'R', 'I']:
                     mag_key = f"JkcStd_mag_{band}"
                     err_key = f"{mag_key}_error"
                     mag_value = gaiaxpy_photometry.get(mag_key)
                     err_value = gaiaxpy_photometry.get(err_key)
                     if mag_value is not None:
                         if err_value is not None:
-                            print(f"  {band}-band magnitude = {mag_value:.3f} ± {err_value:.3f}")
+                            print(f"  {band}-band magnitude = {mag_value:.3f} +/- {err_value:.3f}")
                         else:
                             print(f"  {band}-band magnitude = {mag_value:.3f}")
                     else:
